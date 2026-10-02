@@ -6,6 +6,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from homeassistant.core import callback
+
+from .extras import ccu_device_info, room_device_info
+from .entity import ExtraSensor, get_extras
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE, CONF_SLAVE
 
 from homeassistant.const import (
@@ -221,6 +224,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
     else:
         _LOGGER.debug("We have NO outdoor temperature sensor {0}".format(outdoor_temp))
 
+    extras = get_extras(hass)
+    if extras is not None:
+        entities.extend(ExtraSensor(extras, act) for act in extras.active_for("sensor"))
+
     async_add_entities(entities)
 
 class WavinSentioSensorDataService:
@@ -394,16 +401,7 @@ class WavinSentioOutdoorTemperatureSensor(CoordinatorEntity, SensorEntity):
     def device_info(self):
         temp_location = self._dataservice.get_outdoorTemp()
         if temp_location is not None:
-            return {
-                "identifiers": {
-                    # Serial numbers are unique identifiers within a specific domain
-                    (SENTIO_CLIMATE_DOMAIN, self._dataservice.get_serialNumber())
-                },
-                "name": self._name,
-                "manufacturer": "Wavin",
-                "model": "Sentio",
-                "sw_version": self._dataservice.get_firmwareRevision(),
-            }
+            return ccu_device_info(self._dataservice.get_serialNumber(), self._dataservice.get_firmwareRevision())
         return
     
 class WavinHCSourceTemperatureSensor(SensorEntity):
@@ -459,6 +457,7 @@ class WavinSentioRoomSensor(SensorEntity):
         self._name = "{0} {1}".format(room.name, SENSORTYPE_TO_STRING[self._sensorType])
         self._attr_name = self._name
         self._attr_unique_id = "{0}_{1}".format(self._roomcode, self._name.replace(" ", "_"))
+        self._attr_device_info = room_device_info(str(dataservice.get_serialNumber()), room.index, room.name)
         self._native_value = None
         self._attr_native_value = None
 

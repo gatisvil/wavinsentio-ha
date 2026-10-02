@@ -8,7 +8,8 @@ from homeassistant.core import callback
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
-    HVACMode
+    HVACAction,
+    HVACMode,
 )
 
 from homeassistant.components.sensor import (
@@ -55,6 +56,7 @@ from WavinSentioModbus.SentioTypes import SentioHeatingStates, SentioRoomMode, S
 from WavinSentioModbus.SentioApi import SentioRoom
 
 from . import SentioApiHandler
+from .extras import BLOCKING_SOURCES, MODE_OVERRIDE, room_device_info
 
 HVAC_MODE_HASS_TO_SENTIO: Final[dict[HVACMode, SentioHeatingStates]] = {
     #HVACMode.AUTO: SentioHeatingStates.AUTO,
@@ -124,6 +126,7 @@ class WavinSentioClimateDataService:
 
         self.hass = hass
         self.coordinator = None
+        self.extras = getattr(api, "extras", None)
 
     @callback
     def async_setup(self):
@@ -184,6 +187,7 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         self._enable_turn_on_off_backwards_compatibility = False
         self._attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON 
         self._attr_hvac_modes = [HVACMode.AUTO, HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL]
+        self._attr_hvac_action = None
         self._attr_hvac_mode = HVACMode.AUTO
         self._attr_min_temp = DEFAULT_MIN_TEMPERATURE
         self._attr_max_temp = DEFAULT_MAX_TEMPERATURE
@@ -223,62 +227,73 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         await self.async_set_hvac_mode(HVACMode.OFF)
 
     async def async_turn_on(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.HEAT)
+        await self.async_set_hvac_mode(HVACMode.AUTO)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set new target hvac mode."""
-        if hvac_mode == HVACMode.OFF:
-            self._on = False
-            await self._dataservice.set_new_temperature(self._roomcode, self._attr_min_temp)
+        """Set new target hvac mode (AUTO = schedule, HEAT/COOL = manual, OFF = manual at minimum temperature)."""
+        room = self._dataservice.get_room(self._roomcode)
+        if room is None:
+            _LOGGER.debug("Failed to get room with index {0}".format(self._roomcode))
+            return
+        if hvac_mode == HVACMode.AUTO:
+            await self._hass.async_add_executor_job(room.setRoomMode, SentioRoomMode.SCHEDULE)
         else:
-            self._on = True
-            if hvac_mode == HVACMode.AUTO:
-                temp_room = self._dataservice.get_room(self._roomcode)
-                if temp_room is not None:
-                    await self._hass.async_add_executor_job(temp_room.setRoomMode, SentioRoomMode.SCHEDULE)
-                    self._hvac_mode = HVACMode.AUTO
-                else:
-                    _LOGGER.debug("Failed to get room with index {0}".format(self._roomcode))
-            else:
-                _LOGGER.debug("Hvac mode follows, not settable {0}".format(hvac_mode))
+            await self._hass.async_add_executor_job(room.setRoomMode, SentioRoomMode.MANUAL)
+            if hvac_mode == HVACMode.OFF:
+                await self._dataservice.set_new_temperature(self._roomcode, self._attr_min_temp)
+            elif (room.getRoomSetpoint() or 0) <= self._attr_min_temp:
+                await self._dataservice.set_new_temperature(self._roomcode, 21)
         self.updateSentioData()
+        self.async_write_ha_state()
 
     def updateSentioData(self) -> None:
         """Retrieve latest state."""
         temp_room = self._dataservice.get_room(self._roomcode)
-        if temp_room is not None:
-            if temp_room.getRoomRelativeHumidity() != None:
-                self._attr_current_humidity = int(temp_room.getRoomRelativeHumidity())
-            
-            self._attr_target_temperature = temp_room.getRoomSetpoint()
-            self._attr_current_temperature = temp_room.getRoomActualTemperature()
-            self._current_temperature = self._attr_current_temperature
-            self._current_humidity = self._attr_current_humidity
+        if temp_room is None:
+            return
+        if temp_room.getRoomRelativeHumidity() != None:
+            self._attr_current_humidity = int(temp_room.getRoomRelativeHumidity())
+        self._current_humidity = getattr(self, "_attr_current_humidity", None)
 
-            roomMode = temp_room.getRoomMode()
-            if roomMode == SentioRoomMode.SCHEDULE:
-                self._hvac_mode = HVACMode.AUTO
-            else:    
-                self._hvac_mode = HVAC_MODE_SENTIO_TO_HASS[temp_room.getRoomHeatingState()]
-            self._attr_hvac_mode = self._hvac_mode
+        self._attr_target_temperature = temp_room.getRoomSetpoint()
+        self._attr_current_temperature = temp_room.getRoomActualTemperature()
+        self._current_temperature = self._attr_current_temperature
 
-            _LOGGER.debug(
-                "Update {0}, current temp: {1} state = {2} || {3}".format(self._name, self._attr_current_temperature, temp_room.getRoomHeatingState(), self._hvac_mode )
-            )
+        extras = self._dataservice.extras
+        cooling_season = extras is not None and extras.get("hc_mode") == 1
 
+        try:
+            state = temp_room.getRoomHeatingState()
+        except Exception:  # noqa: BLE001  unknown enum value from the unit
+            state = None
+        if state == SentioHeatingStates.HEATING:
+            self._attr_hvac_action = HVACAction.HEATING
+        elif state == SentioHeatingStates.COOLING:
+            self._attr_hvac_action = HVACAction.COOLING
+        elif state is None:
+            self._attr_hvac_action = None
+        else:
+            # IDLE and BLOCKED_* : the room is on but currently not demanding anything
+            self._attr_hvac_action = HVACAction.IDLE
+
+        if temp_room.getRoomMode() == SentioRoomMode.SCHEDULE:
+            self._hvac_mode = HVACMode.AUTO
+        elif (self._attr_target_temperature or 0) <= self._attr_min_temp:
+            self._hvac_mode = HVACMode.OFF
+        else:
+            self._hvac_mode = HVACMode.COOL if cooling_season else HVACMode.HEAT
+        self._attr_hvac_mode = self._hvac_mode
+
+        attrs = {}
+        if extras is not None:
+            blocked = extras.get("room_blocking", self._roomcode)
+            if blocked is not None:
+                attrs["blocked_by"] = BLOCKING_SOURCES.get(blocked, blocked)
+            override = extras.get("room_mode_override", self._roomcode)
+            if override is not None:
+                attrs["mode_override"] = MODE_OVERRIDE.get(override, override)
+        self._attr_extra_state_attributes = attrs
 
     @property
     def device_info(self):
-        temp_room = self._dataservice.get_room(self._roomcode)
-        if temp_room is not None:
-            return {
-                "identifiers": {
-                    # Serial numbers are unique identifiers within a specific domain
-                    (SENTIO_CLIMATE_DOMAIN, self._dataservice.get_serialNumber())
-                },
-                "name": self._name,
-                "manufacturer": "Wavin",
-                "model": "Sentio",
-                "sw_version": self._dataservice.get_firmwareRevision(),
-            }
-        return
+        return room_device_info(str(self._dataservice.get_serialNumber()), self._roomcode, self._name)

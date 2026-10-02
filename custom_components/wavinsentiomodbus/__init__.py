@@ -7,6 +7,7 @@ from homeassistant import config_entries, core
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, Unauthorized
 
 from .const import DOMAIN
+from .extras import MODBUS_LOCK, SentioExtras, ccu_device_info
 
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE, CONF_SLAVE, Platform
 from homeassistant.core import HomeAssistant
@@ -15,25 +16,37 @@ from WavinSentioModbus.SentioApi import SentioModbus, NoConnectionPossible, Modb
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = [
+    Platform.CLIMATE,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.NUMBER,
+    Platform.SELECT,
+]
 
-def _slave_compat(orig):
-    """Wrap a pymodbus client method so the legacy ``slave=`` keyword maps to ``device_id=``."""
+
+def _slave_compat(orig, map_slave):
+    """Wrap a pymodbus client method: serialise access and map legacy ``slave=`` to ``device_id=``."""
 
     @functools.wraps(orig)
     def wrapper(self, *args, slave=None, **kwargs):
         if slave is not None:
-            kwargs.setdefault("device_id", slave)
-        return orig(self, *args, **kwargs)
+            kwargs.setdefault("device_id" if map_slave else "slave", slave)
+        with MODBUS_LOCK:
+            return orig(self, *args, **kwargs)
 
     wrapper._wavin_slave_compat = True
     return wrapper
 
 
 def _install_pymodbus_slave_compat() -> None:
-    """WavinSentioModbus 0.9.0 still calls pymodbus with ``slave=``.
+    """Make the synchronous pymodbus clients safe for WavinSentioModbus 0.9.0.
 
-    pymodbus >= 3.11 (shipped with current Home Assistant) only accepts ``device_id=``. Patch only the
-    synchronous client classes used by that library (never the async clients used by HA's own modbus).
+    * pymodbus >= 3.11 (shipped with current Home Assistant) only accepts ``device_id=``, the library
+      still calls with ``slave=``: map it.
+    * The sync client is not thread-safe and several coordinators/entities use it from executor threads:
+      serialise every request with one process-wide lock.
     """
     try:
         from pymodbus.client import ModbusSerialClient, ModbusTcpClient
@@ -43,6 +56,7 @@ def _install_pymodbus_slave_compat() -> None:
         for name in (
             "read_holding_registers",
             "read_input_registers",
+            "read_discrete_inputs",
             "write_register",
             "write_registers",
         ):
@@ -50,9 +64,8 @@ def _install_pymodbus_slave_compat() -> None:
             if orig is None or getattr(orig, "_wavin_slave_compat", False):
                 continue
             params = inspect.signature(orig).parameters
-            if "slave" in params or "device_id" not in params:
-                continue  # old pymodbus (accepts slave) or unknown signature: leave untouched
-            setattr(cls, name, _slave_compat(orig))
+            map_slave = "slave" not in params and "device_id" in params
+            setattr(cls, name, _slave_compat(orig, map_slave))
 
 
 _install_pymodbus_slave_compat()
@@ -81,9 +94,23 @@ async def async_setup_entry(
     except NoConnectionPossible as err:
         raise ConfigEntryNotReady(err) from err
 
-    await hass.config_entries.async_forward_entry_setups(
-        entry, [Platform.CLIMATE, Platform.SENSOR]
+    extras = SentioExtras(hass, api, entry)
+    api.extras = extras
+    try:
+        await extras.async_setup()
+    except Exception as err:  # noqa: BLE001  extras are optional: never break the core integration
+        _LOGGER.warning("Wavin Sentio extra registers unavailable: %s", err)
+        extras.coordinator = None
+
+    # The CCU itself is the parent ("via") device of every room / circuit device.
+    from homeassistant.helpers import device_registry as dr
+
+    ccu = ccu_device_info(extras.serial, extras.firmware) if getattr(extras, "io", None) else ccu_device_info(
+        str(api.sentioData.serial_number), None
     )
+    dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, **ccu)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
@@ -91,8 +118,7 @@ async def async_setup_entry(
 async def async_unload_entry(hass: HomeAssistant, entry: config_entries.ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(
-        entry, [Platform.CLIMATE, Platform.SENSOR]
-    )
+        entry, PLATFORMS)
     if unload_ok:
         api = hass.data.pop(DOMAIN, None)
         if api is not None:
@@ -108,6 +134,7 @@ class SentioApiHandler:
         self._initialized = False
         self._value = 0
         self._hass = hass
+        self.extras = None
         self._api = SentioModbus(type, host, port, slave, port, loglevel)
         _LOGGER.debug("Sentio API class {0}".format(self._value))
 
