@@ -31,10 +31,6 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 
-from homeassistant.components.climate.const import (
-    ATTR_HUMIDITY,
-)
-
 from homeassistant.exceptions import ConfigEntryAuthFailed
 
 import homeassistant.helpers.config_validation as cv
@@ -115,12 +111,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
         
     async_add_entities(entities)
 
-    sensors = True
-    if sensors:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, "sensor")
-        )
-
 
 
 class WavinSentioClimateDataService:
@@ -174,7 +164,7 @@ class WavinSentioClimateDataService:
 
     async def set_new_profile(self, roomIndex, profile):
         _LOGGER.debug("Setting profile: {0} -> {1}".format(roomIndex, profile))
-        await self.hass.async_add_executor_job(self.api.set_profile, roomIndex, profile)
+        await self.hass.async_add_executor_job(self._api.set_profile, roomIndex, profile)
 
 
 class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
@@ -225,7 +215,7 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         _LOGGER.debug("--------------------> Set Temperature {0}".format(temperature))
         if self._hvac_mode == HVACMode.AUTO:
             temp_room = self._dataservice.get_room(self._roomcode)
-            temp_room.setRoomMode(SentioRoomMode.MANUAL)
+            await self._hass.async_add_executor_job(temp_room.setRoomMode, SentioRoomMode.MANUAL)
         await self._dataservice.set_new_temperature(self._roomcode, temperature)
         self.updateSentioData()
 
@@ -233,7 +223,7 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         await self.async_set_hvac_mode(HVACMode.OFF)
 
     async def async_turn_on(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.HEATING)
+        await self.async_set_hvac_mode(HVACMode.HEAT)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
@@ -243,9 +233,9 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         else:
             self._on = True
             if hvac_mode == HVACMode.AUTO:
-                temp_room = await self.hass.async_add_executor_job(self._dataservice.get_room, self._roomcode)
+                temp_room = self._dataservice.get_room(self._roomcode)
                 if temp_room is not None:
-                    temp_room.setRoomMode(SentioRoomMode.SCHEDULE)
+                    await self._hass.async_add_executor_job(temp_room.setRoomMode, SentioRoomMode.SCHEDULE)
                     self._hvac_mode = HVACMode.AUTO
                 else:
                     _LOGGER.debug("Failed to get room with index {0}".format(self._roomcode))

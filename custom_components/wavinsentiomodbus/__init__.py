@@ -1,8 +1,10 @@
+import functools
+import inspect
 import logging
 
 from homeassistant import config_entries, core
 
-from homeassistant.exceptions import ConfigEntryAuthFailed, Unauthorized
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, Unauthorized
 
 from .const import DOMAIN
 
@@ -14,6 +16,48 @@ from WavinSentioModbus.SentioApi import SentioModbus, NoConnectionPossible, Modb
 _LOGGER = logging.getLogger(__name__)
 
 
+def _slave_compat(orig):
+    """Wrap a pymodbus client method so the legacy ``slave=`` keyword maps to ``device_id=``."""
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, slave=None, **kwargs):
+        if slave is not None:
+            kwargs.setdefault("device_id", slave)
+        return orig(self, *args, **kwargs)
+
+    wrapper._wavin_slave_compat = True
+    return wrapper
+
+
+def _install_pymodbus_slave_compat() -> None:
+    """WavinSentioModbus 0.9.0 still calls pymodbus with ``slave=``.
+
+    pymodbus >= 3.11 (shipped with current Home Assistant) only accepts ``device_id=``. Patch only the
+    synchronous client classes used by that library (never the async clients used by HA's own modbus).
+    """
+    try:
+        from pymodbus.client import ModbusSerialClient, ModbusTcpClient
+    except ImportError:  # pragma: no cover
+        return
+    for cls in (ModbusTcpClient, ModbusSerialClient):
+        for name in (
+            "read_holding_registers",
+            "read_input_registers",
+            "write_register",
+            "write_registers",
+        ):
+            orig = getattr(cls, name, None)
+            if orig is None or getattr(orig, "_wavin_slave_compat", False):
+                continue
+            params = inspect.signature(orig).parameters
+            if "slave" in params or "device_id" not in params:
+                continue  # old pymodbus (accepts slave) or unknown signature: leave untouched
+            setattr(cls, name, _slave_compat(orig))
+
+
+_install_pymodbus_slave_compat()
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: config_entries.ConfigEntry
 ) -> bool:
@@ -23,24 +67,37 @@ async def async_setup_entry(
     _LOGGER.debug("__INIT__ Setting up with data --> {0}".format(entry.data))
     
     hass.data[DOMAIN] = SentioApiHandler(entry.data[CONF_TYPE], entry.data[CONF_HOST], entry.data[CONF_PORT], entry.data[CONF_SLAVE], logging.DEBUG, hass)
-    #try:      
-    #    api = await hass.async_add_executor_job(
-    #        SentioModbus, entry.data[CONF_TYPE], entry.data[CONF_HOST], entry.data[CONF_PORT], entry.data[CONF_SLAVE], entry.data[CONF_PORT], logging.DEBUG
-    #    )
-    #    
-    #    status = await hass.async_add_executor_job(api.connect)
-    #
-    #    if status != 0:
-    #        raise ConfigEntryAuthFailed("Failed to connect")
-    #
-    #except NoConnectionPossible as err:
-    #    raise ConfigEntryAuthFailed(err) from err
+    api = hass.data[DOMAIN]
 
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setups(entry, ["climate"])
+    # Connect + initialize once, here, BEFORE the platforms start. The climate and sensor
+    # platforms are set up concurrently and would otherwise race on the same Modbus client.
+    try:
+        if not await api.connect():
+            raise ConfigEntryNotReady(
+                "Cannot connect to Wavin Sentio at {0}:{1}".format(entry.data[CONF_HOST], entry.data[CONF_PORT])
+            )
+        if not await api.initialize():
+            raise ConfigEntryNotReady("Wavin Sentio connected but initialization failed")
+    except NoConnectionPossible as err:
+        raise ConfigEntryNotReady(err) from err
+
+    await hass.config_entries.async_forward_entry_setups(
+        entry, [Platform.CLIMATE, Platform.SENSOR]
     )
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: config_entries.ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, [Platform.CLIMATE, Platform.SENSOR]
+    )
+    if unload_ok:
+        api = hass.data.pop(DOMAIN, None)
+        if api is not None:
+            await api.disconnect()
+    return unload_ok
 
 
 class SentioApiHandler:
@@ -66,6 +123,15 @@ class SentioApiHandler:
                 _LOGGER.debug("Sentio connection failed")
         return self._connected
 
+    async def disconnect(self):
+        if self._connected:
+            try:
+                await self._hass.async_add_executor_job(self._api.disconnect)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Sentio disconnect failed: {0}".format(err))
+            self._connected = False
+            self._initialized = False
+
     async def initialize(self):
         if self._initialized:
             _LOGGER.info("Sentio data already initialized")
@@ -84,7 +150,7 @@ class SentioApiHandler:
             await self._hass.async_add_executor_job(self._api.updateData)
     
     async def setRoomTemperature(self, roomIndex, temperature):
-        room = self.getRoom(self, roomIndex)
+        room = self.getRoom(roomIndex)
         await self._hass.async_add_executor_job(room.setRoomSetpoint, temperature)
 
     @property
