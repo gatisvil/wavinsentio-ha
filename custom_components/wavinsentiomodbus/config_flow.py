@@ -63,7 +63,7 @@ class WavinSentioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_HOST, description="host"): str,
+                vol.Required(CONF_HOST, default="192.168.188.14", description="host"): str, #TODO REMOVE DEFAULT
                 vol.Required(CONF_PORT, default=502, description="port"): int,
                 vol.Required(CONF_SLAVE, default=1, description="slave"): int,
             }
@@ -81,6 +81,8 @@ class WavinSentioConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.data = user_input
         errors: dict[str, str] = {}
         _LOGGER.debug("Serial Modbus not yet supported.... ") #TODO REMOVE
+        if user_input is None:
+            return None
         if user_input is not None:
             self.data[CONF_TYPE] = ModbusType.MODBUS_RTU
             data = await self.async_validate_wavin_sentio_connection(user_input, errors)

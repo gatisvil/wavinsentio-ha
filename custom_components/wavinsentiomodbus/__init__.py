@@ -1,3 +1,5 @@
+import functools
+import inspect
 import logging
 
 from homeassistant import config_entries, core
@@ -5,6 +7,7 @@ from homeassistant import config_entries, core
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, Unauthorized
 
 from .const import DOMAIN
+from .extras import MODBUS_LOCK, SentioExtras, ccu_device_info
 
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE, CONF_SLAVE, Platform
 from homeassistant.core import HomeAssistant
@@ -13,43 +16,113 @@ from WavinSentioModbus.SentioApi import SentioModbus, NoConnectionPossible, Modb
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = [
+    Platform.CLIMATE,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.NUMBER,
+    Platform.SELECT,
+]
+
+
+def _slave_compat(orig, map_slave):
+    """Wrap a pymodbus client method: serialise access and map legacy ``slave=`` to ``device_id=``."""
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, slave=None, **kwargs):
+        if slave is not None:
+            kwargs.setdefault("device_id" if map_slave else "slave", slave)
+        with MODBUS_LOCK:
+            return orig(self, *args, **kwargs)
+
+    wrapper._wavin_slave_compat = True
+    return wrapper
+
+
+def _install_pymodbus_slave_compat() -> None:
+    """Make the synchronous pymodbus clients safe for WavinSentioModbus 0.9.0.
+
+    * pymodbus >= 3.11 (shipped with current Home Assistant) only accepts ``device_id=``, the library
+      still calls with ``slave=``: map it.
+    * The sync client is not thread-safe and several coordinators/entities use it from executor threads:
+      serialise every request with one process-wide lock.
+    """
+    try:
+        from pymodbus.client import ModbusSerialClient, ModbusTcpClient
+    except ImportError:  # pragma: no cover
+        return
+    for cls in (ModbusTcpClient, ModbusSerialClient):
+        for name in (
+            "read_holding_registers",
+            "read_input_registers",
+            "read_discrete_inputs",
+            "write_register",
+            "write_registers",
+        ):
+            orig = getattr(cls, name, None)
+            if orig is None or getattr(orig, "_wavin_slave_compat", False):
+                continue
+            params = inspect.signature(orig).parameters
+            map_slave = "slave" not in params and "device_id" in params
+            setattr(cls, name, _slave_compat(orig, map_slave))
+
+
+_install_pymodbus_slave_compat()
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: config_entries.ConfigEntry
 ) -> bool:
     """Set up platform from a ConfigEntry."""
     hass.data.setdefault(DOMAIN, {})
+    #hass_data = dict(entry.data)
     _LOGGER.debug("__INIT__ Setting up with data --> {0}".format(entry.data))
+    
+    hass.data[DOMAIN] = SentioApiHandler(entry.data[CONF_TYPE], entry.data[CONF_HOST], entry.data[CONF_PORT], entry.data[CONF_SLAVE], logging.DEBUG, hass)
+    api = hass.data[DOMAIN]
 
-    handler = SentioApiHandler(
-        entry.data[CONF_TYPE], entry.data[CONF_HOST],
-        entry.data[CONF_PORT], entry.data[CONF_SLAVE], logging.DEBUG, hass
-    )
-    hass.data[DOMAIN][entry.entry_id] = handler
-
+    # Connect + initialize once, here, BEFORE the platforms start. The climate and sensor
+    # platforms are set up concurrently and would otherwise race on the same Modbus client.
     try:
-        connected = await handler.connect()
-        if not connected:
-            raise ConfigEntryNotReady("Failed to connect to Wavin Sentio")
-        initialized = await handler.initialize()
-        if not initialized:
-            raise ConfigEntryNotReady("Failed to initialize Wavin Sentio")
-    except (AttributeError, NoConnectionPossible) as err:
-        raise ConfigEntryNotReady(str(err)) from err
+        if not await api.connect():
+            raise ConfigEntryNotReady(
+                "Cannot connect to Wavin Sentio at {0}:{1}".format(entry.data[CONF_HOST], entry.data[CONF_PORT])
+            )
+        if not await api.initialize():
+            raise ConfigEntryNotReady("Wavin Sentio connected but initialization failed")
+    except NoConnectionPossible as err:
+        raise ConfigEntryNotReady(err) from err
 
-    await hass.config_entries.async_forward_entry_setups(entry, ["climate"])
+    extras = SentioExtras(hass, api, entry)
+    api.extras = extras
+    try:
+        await extras.async_setup()
+    except Exception as err:  # noqa: BLE001  extras are optional: never break the core integration
+        _LOGGER.warning("Wavin Sentio extra registers unavailable: %s", err)
+        extras.coordinator = None
+
+    # The CCU itself is the parent ("via") device of every room / circuit device.
+    from homeassistant.helpers import device_registry as dr
+
+    ccu = ccu_device_info(extras.serial, extras.firmware) if getattr(extras, "io", None) else ccu_device_info(
+        str(api.sentioData.serial_number), None
+    )
+    dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, **ccu)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(
-    hass: HomeAssistant, entry: config_entries.ConfigEntry
-) -> bool:
-    """Unload a config entry and close the Modbus connection."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["climate", "sensor"])
+async def async_unload_entry(hass: HomeAssistant, entry: config_entries.ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, PLATFORMS)
     if unload_ok:
-        handler: SentioApiHandler = hass.data[DOMAIN].pop(entry.entry_id)
-        await hass.async_add_executor_job(handler._api.disconnect)
+        api = hass.data.pop(DOMAIN, None)
+        if api is not None:
+            await api.disconnect()
     return unload_ok
 
 
@@ -61,8 +134,8 @@ class SentioApiHandler:
         self._initialized = False
         self._value = 0
         self._hass = hass
-        self._api = SentioModbus(ModbusType(type), host, port, slave, 0, loglevel)
-        self.coordinator = None
+        self.extras = None
+        self._api = SentioModbus(type, host, port, slave, port, loglevel)
         _LOGGER.debug("Sentio API class {0}".format(self._value))
 
     async def connect(self):
@@ -76,6 +149,15 @@ class SentioApiHandler:
             else:
                 _LOGGER.debug("Sentio connection failed")
         return self._connected
+
+    async def disconnect(self):
+        if self._connected:
+            try:
+                await self._hass.async_add_executor_job(self._api.disconnect)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Sentio disconnect failed: {0}".format(err))
+            self._connected = False
+            self._initialized = False
 
     async def initialize(self):
         if self._initialized:
@@ -108,11 +190,6 @@ class SentioApiHandler:
     def getItcData(self):
         return self._api.availableItcs
     
-    def getHccData(self):
-        return self._api.availableHccs
-    
-    def getBoilerTanks(self):
-        return self._api.boilerTanks
     @property
     def outdoorTemperature(self):
         return self._api.sentioData.outdoor_temperature
@@ -121,8 +198,6 @@ class SentioApiHandler:
     def hcSourceState(self):
         return self._api.sentioData.hc_source_state
 
-    def getTemperatureSensors(self, index):
-        return self._api.sentioData.temperature_sensors(index)
 
     def getRoom(self, index):
         for room in self._api.availableRooms:
@@ -135,19 +210,8 @@ class SentioApiHandler:
             if itc.index == index:
                 return itc
         return None
-    
-    def getHccCircuit(self, index):
-        for hcc in self._api.availableHccs:
-            if hcc.index == index:
-                return hcc
-        return None
 
-    def getBoilerTankByIndex(self, index):
-        for tank in self._api.boilerTanks:
-            if tank.index == index:
-                return tank
-        return None
-    
+
 async def async_setup(hass: core.HomeAssistant, config: dict) -> bool:
     """Set up the Wavin Sentio component."""
     # @TODO: Add setup code.
