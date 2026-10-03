@@ -10,7 +10,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .extras import Active, SentioExtras, ccu_device_info, room_device_info
+from .extras import Active, SentioExtras, ccu_device_info, object_device_info, room_device_info
 
 _CATEGORY = {"diagnostic": EntityCategory.DIAGNOSTIC, "config": EntityCategory.CONFIG}
 
@@ -42,16 +42,10 @@ class ExtraEntity(CoordinatorEntity):
             self._attr_device_info = room_device_info(extras.serial, act.index, act.obj_name)
         elif scope in ("location", "outdoor"):
             self._attr_name = reg.name
-            self._attr_device_info = ccu_device_info(extras.serial, extras.firmware)
+            self._attr_device_info = ccu_device_info(extras.serial, extras.firmware)  # identifiers match the CCU device
         else:  # dhw / tank / hcc / itc / vent / dehum: their own device
             self._attr_name = reg.name
-            self._attr_device_info = {
-                "identifiers": {(DOMAIN, f"{extras.serial}_{scope}_{act.index}")},
-                "name": act.obj_name,
-                "manufacturer": "Wavin",
-                "model": scope.upper(),
-                "via_device": (DOMAIN, extras.serial),
-            }
+            self._attr_device_info = object_device_info(extras.serial, scope, act.index)
 
     @property
     def _value(self):

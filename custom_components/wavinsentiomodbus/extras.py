@@ -276,13 +276,39 @@ class ModbusIO:
 
 
 def room_device_info(serial: str, index: int, name: str) -> dict[str, Any]:
-    return {
-        "identifiers": {(DOMAIN, f"{serial}_room_{index}")},
-        "name": name,
-        "manufacturer": "Wavin",
-        "model": "Sentio room",
-        "via_device": (DOMAIN, serial),
-    }
+    # Only the identifier: the device itself (name, parent, ...) is registered once in register_devices().
+    return {"identifiers": {(DOMAIN, f"{serial}_room_{index}")}}
+
+
+def object_device_info(serial: str, scope: str, index: int) -> dict[str, Any]:
+    return {"identifiers": {(DOMAIN, f"{serial}_{scope}_{index}")}}
+
+
+def register_devices(hass: HomeAssistant, entry: Any, serial: str, firmware: str | None, rooms: dict[int, str], objects: dict[str, str]) -> None:
+    """Create the CCU device and its room / circuit child devices (children point at the CCU)."""
+    from homeassistant.helpers import device_registry as dr
+
+    reg = dr.async_get(hass)
+    ccu = reg.async_get_or_create(config_entry_id=entry.entry_id, **ccu_device_info(serial, firmware))
+
+    def child(identifier: str, name: str, model: str) -> None:
+        kwargs = dict(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, identifier)},
+            name=name,
+            manufacturer="Wavin",
+            model=model,
+        )
+        try:
+            reg.async_get_or_create(via_device_id=ccu.id, **kwargs)
+        except TypeError:  # older Home Assistant: only the identifier form exists
+            reg.async_get_or_create(via_device=(DOMAIN, serial), **kwargs)
+
+    for idx, name in rooms.items():
+        child(f"{serial}_room_{idx}", name, "Sentio room")
+    for key, name in objects.items():
+        scope, idx = key.split(":")
+        child(f"{serial}_{scope}_{idx}", name, scope.upper())
 
 
 def ccu_device_info(serial: str, fw: str | None = None) -> dict[str, Any]:

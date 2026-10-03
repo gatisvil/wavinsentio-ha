@@ -7,7 +7,7 @@ from homeassistant import config_entries, core
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, Unauthorized
 
 from .const import DOMAIN
-from .extras import MODBUS_LOCK, SentioExtras, ccu_device_info
+from .extras import MODBUS_LOCK, SentioExtras, register_devices
 
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE, CONF_SLAVE, Platform
 from homeassistant.core import HomeAssistant
@@ -102,13 +102,11 @@ async def async_setup_entry(
         _LOGGER.warning("Wavin Sentio extra registers unavailable: %s", err)
         extras.coordinator = None
 
-    # The CCU itself is the parent ("via") device of every room / circuit device.
-    from homeassistant.helpers import device_registry as dr
-
-    ccu = ccu_device_info(extras.serial, extras.firmware) if getattr(extras, "io", None) else ccu_device_info(
-        str(api.sentioData.serial_number), None
+    # The CCU is the parent device of every room / circuit device: register them all up-front.
+    rooms = {r.index: r.name for r in (api.getAvailableRooms() or [])}
+    register_devices(
+        hass, entry, str(api.sentioData.serial_number), getattr(extras, "firmware", None), rooms, extras.objects
     )
-    dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, **ccu)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
