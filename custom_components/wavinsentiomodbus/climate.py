@@ -57,6 +57,7 @@ from WavinSentioModbus.SentioApi import SentioRoom
 
 from . import SentioApiHandler
 from .extras import BLOCKING_SOURCES, MODE_OVERRIDE, room_device_info
+from .setpoint import set_room_setpoint
 
 HVAC_MODE_HASS_TO_SENTIO: Final[dict[HVACMode, SentioHeatingStates]] = {
     #HVACMode.AUTO: SentioHeatingStates.AUTO,
@@ -216,12 +217,22 @@ class WavinSentioEntity(CoordinatorEntity, ClimateEntity):
         """Set new target temperature."""
         if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
-        _LOGGER.debug("--------------------> Set Temperature {0}".format(temperature))
-        if self._hvac_mode == HVACMode.AUTO:
-            temp_room = self._dataservice.get_room(self._roomcode)
-            await self._hass.async_add_executor_job(temp_room.setRoomMode, SentioRoomMode.MANUAL)
-        await self._dataservice.set_new_temperature(self._roomcode, temperature)
+        extras = self._dataservice.extras
+        room = self._dataservice.get_room(self._roomcode)
+        try:
+            if extras is not None and extras.io is not None:
+                await self._hass.async_add_executor_job(set_room_setpoint, extras.io, self._roomcode, temperature)
+            else:
+                if self._hvac_mode == HVACMode.AUTO:
+                    await self._hass.async_add_executor_job(room.setRoomMode, SentioRoomMode.MANUAL)
+                await self._dataservice.set_new_temperature(self._roomcode, temperature)
+        finally:
+            # show what the unit really has: re-read everything instead of trusting the library's cache
+            await self._dataservice.coordinator.async_request_refresh()
+        if room is not None:
+            room.temperatureSetPoint = temperature
         self.updateSentioData()
+        self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
         await self.async_set_hvac_mode(HVACMode.OFF)
